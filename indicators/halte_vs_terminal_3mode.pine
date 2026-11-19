@@ -1,0 +1,277 @@
+//@version=6
+indicator("3-Mode SMC & Halte Regime Engine [Arist MD]", shorttitle="MD 3-Mode SMC/Halte", overlay=true, max_boxes_count=300, max_lines_count=300, max_labels_count=300)
+
+// ============================================================================
+// Arist MD (Mancing Dollar) 3-Mode Switcher ("Halte vs Terminal"):
+//   Mode 1: Pure SMC (0 Indicator) - Wick vs Body BOS, >=2 counter-candle swings,
+//           Strong vs Weak H/L, MSS/TC/SB, PD Range (0/0.5/1), Unmitigated 3-candle
+//           Imbalance (FVG), EQH/EQL Liquidity Sweep markers
+//   Mode 2: Fibo Golden Pullback - 0.236, 0.382, 0.50, 0.618, 0.786 SL, 1.272, 1.618
+//   Mode 3: Indicator Halte + Regime Filter - 4MA (25/50/100/200) or Scalp Ribbon
+//           (5/50/100/200), BB(20, SMA, 2), Ichimoku(9,26,52,26), NO-TRADE Kumo/4MA Banner
+// ============================================================================
+
+grpMode = "0. Operational Mode Selector"
+opMode = input.string("Mode 1: Pure SMC", "Active Mode", options=["Mode 1: Pure SMC", "Mode 2: Fibo Golden Pullback", "Mode 3: Indicator Halte + Regime Filter"], group=grpMode)
+
+grpSmc = "1. Pure SMC Settings"
+bosRule = input.string("Body Close", "BOS Break Rule", options=["Body Close", "Wick Break"], group=grpSmc)
+swingLen = input.int(5, "Swing Pivot Length", minval=2, maxval=25, group=grpSmc)
+minCounterBars = input.int(2, "Min Counter-Candles for Valid Swing", minval=1, maxval=5, group=grpSmc)
+eqTolAtrMult = input.float(0.15, "EQH/EQL Tolerance (ATR Mult)", minval=0.05, maxval=0.50, step=0.05, group=grpSmc)
+showPD = input.bool(true, "Show PD Range (0 / 0.5 Equilibrium / 1.0)", group=grpSmc)
+showFVG = input.bool(true, "Show 3-Candle Imbalance (FVG) Mitigation", group=grpSmc)
+showEqSweeps = input.bool(true, "Show EQH/EQL Liquidity & Sweeps", group=grpSmc)
+
+grpFibo = "2. Fibo Golden Pullback Settings"
+fiboLookback = input.int(50, "Auto-Fibo Swing Lookback", minval=20, maxval=300, group=grpFibo)
+
+grpHalte = "3. Indicator Halte & Regime Settings"
+maPreset = input.string("Swing 4MA (25/50/100/200)", "MA Preset", options=["Swing 4MA (25/50/100/200)", "Scalp Ribbon (5/50/100/200)"], group=grpHalte)
+bbLen = input.int(20, "BB Length", minval=5, group=grpHalte)
+bbMult = input.float(2.0, "BB StdDev", minval=0.5, step=0.1, group=grpHalte)
+ichiConv = input.int(9, "Ichimoku Tenkan", minval=2, group=grpHalte)
+ichiBase = input.int(26, "Ichimoku Kijun", minval=5, group=grpHalte)
+ichiSpanB = input.int(52, "Ichimoku Senkou B", minval=10, group=grpHalte)
+ichiDisp = input.int(26, "Ichimoku Displacement", minval=1, group=grpHalte)
+
+bool isMode1 = opMode == "Mode 1: Pure SMC"
+bool isMode2 = opMode == "Mode 2: Fibo Golden Pullback"
+bool isMode3 = opMode == "Mode 3: Indicator Halte + Regime Filter"
+
+// ============================================================================
+// CORE MARKET STRUCTURE & REGIME ENGINE
+// ============================================================================
+float atrVal = ta.atr(14)
+int trendDir = 0
+var int structTrend = 0 // 1 = Bullish, -1 = Bearish
+var float strongLow = na
+var float weakHigh = na
+var float strongHigh = na
+var float weakLow = na
+var float lastPH = na
+var int lastPHBar = na
+var float prevPH = na
+var float lastPL = na
+var int lastPLBar = na
+var float prevPL = na
+var bool warnedMSS = false
+
+// Check pivot high/low and enforce >= minCounterBars counter candles
+float rawPH = ta.pivothigh(high, swingLen, swingLen)
+float rawPL = ta.pivotlow(low, swingLen, swingLen)
+
+bool validPHCounter = false
+if not na(rawPH)
+    int bearCnt = 0
+    for i = 0 to swingLen - 1
+        if close[i] < open[i]
+            bearCnt += 1
+    validPHCounter := bearCnt >= minCounterBars
+
+bool validPLCounter = false
+if not na(rawPL)
+    int bullCnt = 0
+    for i = 0 to swingLen - 1
+        if close[i] > open[i]
+            bullCnt += 1
+    validPLCounter := bullCnt >= minCounterBars
+
+if not na(rawPH) and validPHCounter
+    prevPH := lastPH
+    lastPH := rawPH
+    lastPHBar := bar_index - swingLen
+    if na(weakHigh) or rawPH > weakHigh
+        weakHigh := rawPH
+
+if not na(rawPL) and validPLCounter
+    prevPL := lastPL
+    lastPL := rawPL
+    lastPLBar := bar_index - swingLen
+    if na(weakLow) or rawPL < weakLow
+        weakLow := rawPL
+
+float bullBreakPrice = bosRule == "Body Close" ? close : high
+float bearBreakPrice = bosRule == "Body Close" ? close : low
+
+bool bosUp = not na(lastPH) and bullBreakPrice > lastPH and (bosRule == "Body Close" ? close[1] <= lastPH : high[1] <= lastPH)
+bool bosDn = not na(lastPL) and bearBreakPrice < lastPL and (bosRule == "Body Close" ? close[1] >= lastPL : low[1] >= lastPL)
+
+if isMode1
+    if bosUp and not na(lastPHBar)
+        bool isTrendChange = structTrend == -1
+        structTrend := 1
+        warnedMSS := false
+        if not na(lastPL)
+            strongLow := lastPL
+        weakHigh := high
+        string tag = isTrendChange ? "TC / CHoCH" : "SB / BOS"
+        line.new(lastPHBar, lastPH, bar_index, lastPH, color=isTrendChange ? color.lime : color.teal, width=isTrendChange ? 2 : 1)
+        label.new(bar_index, lastPH, tag, style=label.style_label_down, color=isTrendChange ? color.lime : color.teal, textcolor=color.black, size=size.tiny)
+
+    if bosDn and not na(lastPLBar)
+        bool isTrendChange = structTrend == 1
+        structTrend := -1
+        warnedMSS := false
+        if not na(lastPH)
+            strongHigh := lastPH
+        weakLow := low
+        string tag = isTrendChange ? "TC / CHoCH" : "SB / BOS"
+        line.new(lastPLBar, lastPL, bar_index, lastPL, color=isTrendChange ? color.red : color.maroon, width=isTrendChange ? 2 : 1)
+        label.new(bar_index, lastPL, tag, style=label.style_label_up, color=isTrendChange ? color.red : color.maroon, textcolor=color.white, size=size.tiny)
+
+    // Early warning MSS when structure fails to extend and breaks minor counter close
+    if structTrend == 1 and not warnedMSS and not na(lastPL) and low < lastPL and close >= lastPL
+        warnedMSS := true
+        label.new(bar_index, low, "MSS Warning (Sweep)", style=label.style_label_up, color=color.orange, textcolor=color.black, size=size.tiny)
+
+    if structTrend == -1 and not warnedMSS and not na(lastPH) and high > lastPH and close <= lastPH
+        warnedMSS := true
+        label.new(bar_index, high, "MSS Warning (Sweep)", style=label.style_label_down, color=color.orange, textcolor=color.black, size=size.tiny)
+
+// Strong / Weak High-Low Overlay
+plot(isMode1 and not na(strongLow) ? strongLow : na, "Strong (Protected) Low", color=color.new(color.green, 35), style=plot.style_linebr, linewidth=2)
+plot(isMode1 and not na(strongHigh) ? strongHigh : na, "Strong (Protected) High", color=color.new(color.red, 35), style=plot.style_linebr, linewidth=2)
+
+// PD Range (0 / 0.5 Equilibrium / 1.0)
+var line pdTopLine = na
+var line pdEqLine = na
+var line pdBotLine = na
+if isMode1 and showPD and not na(lastPH) and not na(lastPL) and lastPH > lastPL
+    float pdHi = math.max(lastPH, high)
+    float pdLo = math.min(lastPL, low)
+    float pdEq = (pdHi + pdLo) * 0.5
+    if barstate.islast
+        line.delete(pdTopLine)
+        line.delete(pdEqLine)
+        line.delete(pdBotLine)
+        pdTopLine := line.new(bar_index - 40, pdHi, bar_index + 10, pdHi, color=color.new(color.red, 30), style=line.style_dashed)
+        pdEqLine := line.new(bar_index - 40, pdEq, bar_index + 10, pdEq, color=color.new(color.yellow, 15), style=line.style_solid, linewidth=2)
+        pdBotLine := line.new(bar_index - 40, pdLo, bar_index + 10, pdLo, color=color.new(color.green, 30), style=line.style_dashed)
+
+// 3-Candle Imbalance (FVG) + Mitigation Tracker
+var array<box> fvgBoxes = array.new_box()
+var array<int> fvgDirs = array.new_int()
+if isMode1 and showFVG and bar_index > 3
+    // Bullish Imbalance: low[0] > high[2]
+    if low > high[2] and (low - high[2]) > atrVal * 0.25
+        box b = box.new(bar_index - 2, low, bar_index + 30, high[2], bgcolor=color.new(color.teal, 85), border_color=color.new(color.teal, 40))
+        array.push(fvgBoxes, b)
+        array.push(fvgDirs, 1)
+    // Bearish Imbalance: high[0] < low[2]
+    if high < low[2] and (low[2] - high) > atrVal * 0.25
+        box b = box.new(bar_index - 2, low[2], bar_index + 30, high, bgcolor=color.new(color.crimson, 85), border_color=color.new(color.crimson, 40))
+        array.push(fvgBoxes, b)
+        array.push(fvgDirs, -1)
+
+int fvgSz = array.size(fvgBoxes)
+if fvgSz > 0
+    for idx = fvgSz - 1 to 0
+        box b = array.get(fvgBoxes, idx)
+        int d = array.get(fvgDirs, idx)
+        float bTop = box.get_top(b)
+        float bBot = box.get_bottom(b)
+        bool filled = (d == 1 and low <= bBot) or (d == -1 and high >= bTop)
+        if filled
+            box.delete(b)
+            array.remove(fvgBoxes, idx)
+            array.remove(fvgDirs, idx)
+        else if array.size(fvgBoxes) > 35
+            box.delete(array.shift(fvgBoxes))
+            array.shift(fvgDirs)
+
+// EQH / EQL Detection & Sweep Markers
+bool isEQH = isMode1 and showEqSweeps and not na(rawPH) and not na(prevPH) and math.abs(rawPH - prevPH) <= atrVal * eqTolAtrMult
+bool isEQL = isMode1 and showEqSweeps and not na(rawPL) and not na(prevPL) and math.abs(rawPL - prevPL) <= atrVal * eqTolAtrMult
+if isEQH
+    label.new(bar_index - swingLen, rawPH, "EQH Liquidity", style=label.style_label_down, color=color.new(color.purple, 20), textcolor=color.white, size=size.tiny)
+if isEQL
+    label.new(bar_index - swingLen, rawPL, "EQL Liquidity", style=label.style_label_up, color=color.new(color.purple, 20), textcolor=color.white, size=size.tiny)
+
+// ============================================================================
+// MODE 2: FIBO GOLDEN PULLBACK (0.236 / 0.382 / 0.50 / 0.618 / 0.786 SL / 1.272 / 1.618)
+// ============================================================================
+float fibHi = ta.highest(high, fiboLookback)
+float fibLo = ta.lowest(low, fiboLookback)
+int fibHiOff = ta.highestbars(high, fiboLookback)
+int fibLoOff = ta.lowestbars(low, fiboLookback)
+bool fibBull = fibLoOff < fibHiOff // Low occurred before High => Uptrend pullback
+float fibRng = fibHi - fibLo
+
+float f236 = fibBull ? fibHi - fibRng * 0.236 : fibLo + fibRng * 0.236
+float f382 = fibBull ? fibHi - fibRng * 0.382 : fibLo + fibRng * 0.382
+float f500 = fibBull ? fibHi - fibRng * 0.500 : fibLo + fibRng * 0.500
+float f618 = fibBull ? fibHi - fibRng * 0.618 : fibLo + fibRng * 0.618
+float f786 = fibBull ? fibHi - fibRng * 0.786 : fibLo + fibRng * 0.786
+float f1272 = fibBull ? fibLo + fibRng * 1.272 : fibHi - fibRng * 1.272
+float f1618 = fibBull ? fibLo + fibRng * 1.618 : fibHi - fibRng * 1.618
+
+plot(isMode2 ? f236 : na, "Fibo 0.236 (Scalp TP)", color=color.new(color.gray, 35))
+p500 = plot(isMode2 ? f500 : na, "Fibo 0.500 Golden", color=color.new(color.gold, 15), linewidth=2)
+p618 = plot(isMode2 ? f618 : na, "Fibo 0.618 Golden", color=color.new(color.orange, 10), linewidth=2)
+fill(p500, p618, color=isMode2 ? color.new(color.orange, 84) : na, title="Golden Ratio Zone 0.50-0.618")
+plot(isMode2 ? f786 : na, "Fibo 0.786 (Mandatory SL)", color=color.new(color.red, 10), linewidth=2, style=plot.style_stepline)
+plot(isMode2 ? f1272 : na, "Fibo 1.272 ATH Target", color=color.new(color.lime, 30))
+plot(isMode2 ? f1618 : na, "Fibo 1.618 ATH Target", color=color.new(color.green, 30))
+
+// ============================================================================
+// MODE 3: INDICATOR HALTE + REGIME FILTER (4MA + BB + ICHIMOKU + NO-TRADE BANNER)
+// ============================================================================
+int ma1Len = maPreset == "Swing 4MA (25/50/100/200)" ? 25 : 5
+float ma1 = ta.sma(close, ma1Len)
+float ma2 = ta.sma(close, 50)
+float ma3 = ta.sma(close, 100)
+float ma4 = ta.sma(close, 200)
+
+plot(isMode3 ? ma1 : na, "MA Fast (25 or 5)", color=color.yellow, linewidth=1)
+plot(isMode3 ? ma2 : na, "MA 50", color=color.aqua, linewidth=1)
+plot(isMode3 ? ma3 : na, "MA 100", color=color.blue, linewidth=2)
+plot(isMode3 ? ma4 : na, "MA 200", color=color.purple, linewidth=2)
+
+float bbBasis = ta.sma(close, bbLen)
+float bbDev = ta.stdev(close, bbLen) * bbMult
+plot(isMode3 ? bbBasis + bbDev : na, "BB Upper (20,2)", color=color.new(color.silver, 40))
+plot(isMode3 ? bbBasis - bbDev : na, "BB Lower (20,2)", color=color.new(color.silver, 40))
+
+f_donchian(int len) =>
+    math.avg(ta.lowest(len), ta.highest(len))
+
+float tenkan = f_donchian(ichiConv)
+float kijun = f_donchian(ichiBase)
+float leadA = math.avg(tenkan, kijun)
+float leadB = f_donchian(ichiSpanB)
+
+pLeadA = plot(isMode3 ? leadA : na, "Ichimoku Span A", offset=ichiDisp - 1, color=color.new(color.green, 60))
+pLeadB = plot(isMode3 ? leadB : na, "Ichimoku Span B", offset=ichiDisp - 1, color=color.new(color.red, 60))
+fill(pLeadA, pLeadB, color=isMode3 ? (leadA > leadB ? color.new(color.green, 86) : color.new(color.red, 86)) : na, title="Ichimoku Kumo Cloud")
+
+// Sideways / No-Trade Regime Evaluation
+float activeSpanA = leadA[ichiDisp - 1]
+float activeSpanB = leadB[ichiDisp - 1]
+bool insideKumo = not na(activeSpanA) and not na(activeSpanB) and close >= math.min(activeSpanA, activeSpanB) and close <= math.max(activeSpanA, activeSpanB)
+bool maBullOrdered = ma1 > ma2 and ma2 > ma3 and ma3 > ma4
+bool maBearOrdered = ma1 < ma2 and ma2 < ma3 and ma3 < ma4
+bool maTangled = not maBullOrdered and not maBearOrdered
+bool regimeNoTrade = insideKumo or maTangled
+
+var table banner = table.new(position.top_right, 2, 4, border_width=1)
+if barstate.islast
+    string modeLbl = isMode1 ? "MODE 1: PURE SMC" : isMode2 ? "MODE 2: FIBO PULLBACK" : "MODE 3: HALTE + REGIME"
+    table.cell(banner, 0, 0, "Engine Mode", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(banner, 1, 0, modeLbl, bgcolor=color.rgb(15, 23, 42), text_color=color.aqua, text_size=size.small)
+
+    string structLbl = structTrend == 1 ? "BULLISH" : structTrend == -1 ? "BEARISH" : "NEUTRAL"
+    table.cell(banner, 0, 1, "HTF Structure", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(banner, 1, 1, structLbl, bgcolor=structTrend == 1 ? color.green : structTrend == -1 ? color.red : color.gray, text_color=color.white, text_size=size.small)
+
+    string pdZone = not na(lastPH) and not na(lastPL) ? (close > (lastPH + lastPL) * 0.5 ? "PREMIUM (Sell Only)" : "DISCOUNT (Buy Only)") : "N/A"
+    table.cell(banner, 0, 2, "PD Range", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(banner, 1, 2, pdZone, bgcolor=color.rgb(15, 23, 42), text_color=color.yellow, text_size=size.small)
+
+    string regTxt = regimeNoTrade ? "NO-TRADE / DIAM" : "TREND ACTIVE"
+    string regReason = insideKumo ? " (Inside Kumo)" : maTangled ? " (4MA Kusut)" : ""
+    table.cell(banner, 0, 3, "Regime Filter", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(banner, 1, 3, regTxt + regReason, bgcolor=regimeNoTrade ? color.red : color.green, text_color=color.white, text_size=size.small)
+
+alertcondition(regimeNoTrade, title="Regime NO-TRADE / DIAM Warning", message="MD Regime Filter: {{ticker}} entered Sideways/Kumo NO-TRADE zone")
+alertcondition(bosUp or bosDn, title="SMC BOS / TC Break", message="MD SMC Alert: Structure break on {{ticker}} {{interval}} ({{close}})")

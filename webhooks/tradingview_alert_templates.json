@@ -1,0 +1,63 @@
+{
+  "suite": "stingray-pinescript-suite",
+  "version": "1.0.0",
+  "alerts": [
+    {
+      "id": "prz_entry",
+      "indicator": "indicators/stingray_harmonic_prz.pine",
+      "alertcondition": "Bullish Harmonic / Stingray PRZ",
+      "payload": {
+        "event": "PRZ_ENTRY",
+        "pattern": "Stingray_1.272",
+        "ticker": "{{ticker}}",
+        "timeframe": "{{interval}}",
+        "price": "{{close}}",
+        "sop_checklist": [
+          "Confirm 15M rounding/consolidation inside PRZ or approved Limit Order",
+          "Set System SL outside Point X (never move SL wider)",
+          "Configure TP1=0.382 CD, TP2=0.50 CD (BEP @ 50% floating), TP3=0.618 CD"
+        ]
+      }
+    },
+    {
+      "id": "point_b_trigger",
+      "indicator": "indicators/stingray_harmonic_prz.pine",
+      "alertcondition": "Point B Trigger Dump/Pump",
+      "payload": {
+        "event": "POINT_B_TRIGGER",
+        "ticker": "{{ticker}}",
+        "timeframe": "{{interval}}",
+        "price": "{{close}}",
+        "note": "Point B structure broken — price accelerating toward Point D PRZ"
+      }
+    },
+    {
+      "id": "london_asia_sweep",
+      "indicator": "indicators/mtf_scalp_alignment_hud.pine",
+      "alertcondition": "London Open Asia Range Sweep",
+      "payload": {
+        "event": "LONDON_ASIA_SWEEP",
+        "session_wib": "15:00-19:00",
+        "ticker": "{{ticker}}",
+        "price": "{{close}}",
+        "next_step": "Drop to M10/M5, wait for Body Close CHoCH/BOS, enter Fresh S&D"
+      }
+    },
+    {
+      "id": "mtf_scalp_3tf",
+      "indicator": "indicators/mtf_scalp_alignment_hud.pine",
+      "alertcondition": "3-TF Scalp Alignment Valid",
+      "payload": {
+        "event": "SCALP_3TF_ALIGNED",
+        "timeframes": ["15", "5", "1"],
+        "ticker": "{{ticker}}",
+        "price": "{{close}}",
+        "rules": [
+          "RSI(14) must not sit in ~45-55 neutral zone",
+          "Wait for Kocokan + Last Push in final 120s before candle close",
+          "Target ~5 pts XAUUSD; NEVER convert losing scalp into swing"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,236 @@
+//@version=6
+indicator("Harmonic & Stingray PRZ Engine [Halte vs Terminal]", shorttitle="MD Harmonic/Stingray PRZ", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ============================================================================
+// Arist MD (Mancing Dollar) & Ragnaray Harmonic / Stingray PRZ Architecture
+// Implements:
+//   - Stingray (Proprietary MD: B ~0.382-0.50 XA, D = 1.272 XA, Inval = X)
+//   - Bat (B ~0.382-0.50 XA, D = 0.886 XA, Inval = X)
+//   - Butterfly (B ~0.786 XA, C = 0.382-0.886 AB, D = 1.272 XA)
+//   - Crab (B ~0.382-0.618 XA, D = 1.618 XA)
+//   - Shark (D = 0.886-1.13 XC, Inval > 1.13 XC)
+//   - ABCD (CD/AB ~1.0-1.272, Inval = Point C, TP = 0.618 CD)
+//   - Cascade Plan A -> Plan B (Bat 0.886 X-break -> Stingray 1.272 XA PRZ2)
+//   - Point B Trigger Dump/Pump + Fibo C-D TP1/TP2/TP3 + 50% Zero-Risk Trailing
+// ============================================================================
+
+grpCore = "1. Pivot & Tolerance Settings"
+pivotLen = input.int(5, "Pivot Lookback (Left/Right)", minval=2, maxval=30, group=grpCore)
+ratioTol = input.float(0.035, "Harmonic Ratio Tolerance", minval=0.01, maxval=0.10, step=0.005, group=grpCore)
+maxAgeBars = input.int(250, "Max Active Pattern Age (Bars)", minval=50, maxval=1000, group=grpCore)
+
+grpPatterns = "2. Pattern Toggles"
+useStingray = input.bool(true, "Stingray Pattern (B 0.382-0.50, D 1.272 XA)", group=grpPatterns)
+useBat = input.bool(true, "Bat Pattern (B 0.382-0.50, D 0.886 XA)", group=grpPatterns)
+useButterfly = input.bool(true, "Butterfly Pattern (B 0.786, D 1.272 XA)", group=grpPatterns)
+useCrab = input.bool(true, "Crab Pattern (D 1.618 XA)", group=grpPatterns)
+useShark = input.bool(true, "Shark Pattern (D 0.886-1.13 XC)", group=grpPatterns)
+useAbcd = input.bool(true, "ABCD Pattern (SL Point C, TP 0.618 CD)", group=grpPatterns)
+enablePlanBCascade = input.bool(true, "Cascade Plan A -> Plan B (Bat X Break -> Stingray 1.272)", group=grpPatterns)
+
+grpVis = "3. Targets & Visuals"
+showTargets = input.bool(true, "Draw Fibo C-D Targets (0.382 / 0.50 / 0.618) & 50% Zero-Risk Line", group=grpVis)
+showPointBTrigger = input.bool(true, "Mark Point B Trigger Dump/Pump Breakdown/Breakout", group=grpVis)
+colBull = input.color(color.rgb(16, 185, 129), "Bullish PRZ Color", group=grpVis)
+colBear = input.color(color.rgb(239, 68, 68), "Bearish PRZ Color", group=grpVis)
+colPlanB = input.color(color.rgb(245, 158, 11), "Plan B Stingray Color", group=grpVis)
+
+// Helper functions
+f_near(float val, float target, float tol) =>
+    math.abs(val - target) <= tol
+
+f_in_range(float val, float lo, float hi, float tol) =>
+    val >= (lo - tol) and val <= (hi + tol)
+
+// Store alternating swing pivots
+var array<int> pivBars = array.new_int()
+var array<float> pivPrices = array.new_float()
+var array<int> pivDirs = array.new_int() // 1 = High, -1 = Low
+
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(ph)
+    int bIdx = bar_index - pivotLen
+    int sz = array.size(pivDirs)
+    if sz > 0 and array.get(pivDirs, sz - 1) == 1
+        if ph > array.get(pivPrices, sz - 1)
+            array.set(pivPrices, sz - 1, ph)
+            array.set(pivBars, sz - 1, bIdx)
+    else
+        array.push(pivBars, bIdx)
+        array.push(pivPrices, ph)
+        array.push(pivDirs, 1)
+
+if not na(pl)
+    int bIdx = bar_index - pivotLen
+    int sz = array.size(pivDirs)
+    if sz > 0 and array.get(pivDirs, sz - 1) == -1
+        if pl < array.get(pivPrices, sz - 1)
+            array.set(pivPrices, sz - 1, pl)
+            array.set(pivBars, sz - 1, bIdx)
+    else
+        array.push(pivBars, bIdx)
+        array.push(pivPrices, pl)
+        array.push(pivDirs, -1)
+
+if array.size(pivBars) > 20
+    array.shift(pivBars)
+    array.shift(pivPrices)
+    array.shift(pivDirs)
+
+// Active pattern state for Plan A -> Plan B & Point B trigger
+var string activeName = ""
+var int activeDir = 0 // 1 = Bullish PRZ (Buy), -1 = Bearish PRZ (Sell)
+var float activeX = na
+var float activeB = na
+var float activeC = na
+var float activeD = na
+var float activeInval = na
+var int activeDbar = na
+var bool planBTriggered = false
+var bool pointBTriggered = false
+var string lastPatternKey = ""
+var box activePlanBBox = na
+
+bool bullPrzAlert = false
+bool bearPrzAlert = false
+bool planBAlert = false
+bool pointBAlert = false
+
+int pCount = array.size(pivBars)
+if pCount >= 5
+    int barX = array.get(pivBars, pCount - 5)
+    int barA = array.get(pivBars, pCount - 4)
+    int barB = array.get(pivBars, pCount - 3)
+    int barC = array.get(pivBars, pCount - 2)
+    int barD = array.get(pivBars, pCount - 1)
+
+    float pX = array.get(pivPrices, pCount - 5)
+    float pA = array.get(pivPrices, pCount - 4)
+    float pB = array.get(pivPrices, pCount - 3)
+    float pC = array.get(pivPrices, pCount - 2)
+    float pD = array.get(pivPrices, pCount - 1)
+
+    int dirX = array.get(pivDirs, pCount - 5)
+    int dirD = array.get(pivDirs, pCount - 1)
+
+    // Bullish pattern: X(Low) -> A(High) -> B(Low) -> C(High) -> D(Low)
+    // Bearish pattern: X(High) -> A(Low) -> B(High) -> C(Low) -> D(High)
+    bool isBullShape = dirX == -1 and dirD == -1 and pA > pX and pB < pA and pC > pB and pD < pC
+    bool isBearShape = dirX == 1 and dirD == 1 and pA < pX and pB > pA and pC < pB and pD > pC
+
+    if (isBullShape or isBearShape) and (bar_index - barD <= maxAgeBars)
+        float xa = math.abs(pA - pX)
+        float ab = math.abs(pB - pA)
+        float bc = math.abs(pC - pB)
+        float cd = math.abs(pD - pC)
+        float xc = math.abs(pC - pX)
+
+        if xa > 0 and ab > 0 and bc > 0 and xc > 0
+            float b_xa = ab / xa
+            float c_ab = bc / ab
+            float d_xa = math.abs(pA - pD) / xa
+            float d_xc = math.abs(pC - pD) / xc
+            float cd_ab = cd / ab
+
+            string pat = ""
+            float invalLvl = pX
+            int patDir = isBullShape ? 1 : -1
+
+            // Classification priority: proprietary Stingray first, then classic patterns
+            if useStingray and f_in_range(b_xa, 0.382, 0.50, ratioTol) and f_in_range(c_ab, 0.382, 0.886, ratioTol) and f_near(d_xa, 1.272, ratioTol * 1.4)
+                pat := "Stingray 1.272"
+                invalLvl := pX
+            else if useBat and f_in_range(b_xa, 0.382, 0.50, ratioTol) and f_in_range(c_ab, 0.382, 0.886, ratioTol) and f_near(d_xa, 0.886, ratioTol)
+                pat := "Bat 0.886"
+                invalLvl := pX
+            else if useButterfly and f_near(b_xa, 0.786, ratioTol) and f_in_range(c_ab, 0.382, 0.886, ratioTol) and f_near(d_xa, 1.272, ratioTol * 1.4)
+                pat := "Butterfly 1.272"
+                invalLvl := isBullShape ? pD - xa * 0.14 : pD + xa * 0.14
+            else if useCrab and f_in_range(b_xa, 0.382, 0.618, ratioTol) and f_in_range(c_ab, 0.382, 0.886, ratioTol) and f_near(d_xa, 1.618, ratioTol * 1.6)
+                pat := "Crab 1.618"
+                invalLvl := isBullShape ? pD - xa * 0.16 : pD + xa * 0.16
+            else if useShark and f_in_range(d_xc, 0.886, 1.13, ratioTol)
+                pat := "Shark 0.886-1.13"
+                invalLvl := isBullShape ? pC - xc * (1.13 + ratioTol) : pC + xc * (1.13 + ratioTol)
+            else if useAbcd and f_in_range(cd_ab, 1.0, 1.272, ratioTol * 1.5)
+                pat := "ABCD"
+                invalLvl := pC
+
+            string key = str.format("{0}:{1}:{2}:{3}:{4}:{5}", pat, barX, barA, barB, barC, barD)
+            if pat != "" and key != lastPatternKey
+                lastPatternKey := key
+                activeName := pat
+                activeDir := patDir
+                activeX := pX
+                activeB := pB
+                activeC := pC
+                activeD := pD
+                activeInval := invalLvl
+                activeDbar := barD
+                planBTriggered := false
+                pointBTriggered := false
+
+                color baseCol = patDir == 1 ? colBull : colBear
+                line.new(barX, pX, barA, pA, color=baseCol, width=2)
+                line.new(barA, pA, barB, pB, color=baseCol, width=2)
+                line.new(barB, pB, barC, pC, color=baseCol, width=2)
+                line.new(barC, pC, barD, pD, color=baseCol, width=2)
+                line.new(barX, pX, barB, pB, color=color.new(baseCol, 55), style=line.style_dashed)
+                line.new(barB, pB, barD, pD, color=color.new(baseCol, 55), style=line.style_dashed)
+
+                float przTop = patDir == 1 ? math.max(pD, pD + cd * 0.06) : math.max(pD, pD + cd * 0.04)
+                float przBot = patDir == 1 ? math.min(pD, pD - cd * 0.04) : math.min(pD, pD - cd * 0.06)
+                box.new(barD, przTop, barD + 24, przBot, bgcolor=color.new(baseCol, 82), border_color=baseCol, border_width=1)
+
+                string lblStyle = patDir == 1 ? label.style_label_up : label.style_label_down
+                string txt = (patDir == 1 ? "BULL " : "BEAR ") + pat + "\nPRZ: " + str.tostring(pD, format.mintick) + "\nInval: " + str.tostring(invalLvl, format.mintick)
+                label.new(barD, pD, txt, color=baseCol, textcolor=color.white, style=lblStyle, size=size.small)
+
+                line.new(barD, invalLvl, barD + 24, invalLvl, color=color.red, width=2, style=line.style_dotted)
+
+                if showTargets
+                    float rngCD = math.abs(pC - pD)
+                    float tp1 = patDir == 1 ? pD + rngCD * 0.382 : pD - rngCD * 0.382
+                    float tp2 = patDir == 1 ? pD + rngCD * 0.500 : pD - rngCD * 0.500
+                    float tp3 = patDir == 1 ? pD + rngCD * 0.618 : pD - rngCD * 0.618
+                    float tp618 = pat == "ABCD" ? tp3 : tp1
+                    line.new(barD, tp1, barD + 24, tp1, color=color.new(color.aqua, 20), width=1, style=line.style_dashed)
+                    line.new(barD, tp2, barD + 24, tp2, color=color.new(color.lime, 20), width=1, style=line.style_dashed)
+                    line.new(barD, tp3, barD + 24, tp3, color=color.new(color.green, 10), width=2, style=line.style_dashed)
+                    label.new(barD + 24, tp1, "TP1 (0.382)", style=label.style_label_left, color=color.new(color.aqua, 30), textcolor=color.white, size=size.tiny)
+                    label.new(barD + 24, tp2, "TP2 (0.50) / Zero-Risk BEP @ 50%", style=label.style_label_left, color=color.new(color.lime, 30), textcolor=color.black, size=size.tiny)
+                    label.new(barD + 24, tp618, pat == "ABCD" ? "ABCD TP (0.618 CD)" : "TP3 (0.618)", style=label.style_label_left, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+
+                if patDir == 1
+                    bullPrzAlert := true
+                else
+                    bearPrzAlert := true
+
+// Point B Trigger Dump/Pump & Plan A -> Plan B Cascade evaluation on live bars
+if activeName != "" and not na(activeDbar) and (bar_index - activeDbar <= maxAgeBars)
+    if showPointBTrigger and not pointBTriggered and not na(activeB)
+        bool breakB = activeDir == 1 ? close < activeB : close > activeB
+        if breakB
+            pointBTriggered := true
+            pointBAlert := true
+            string msgB = activeDir == 1 ? "Point B Trigger DUMP -> Target PRZ/D" : "Point B Trigger PUMP -> Target PRZ/D"
+            label.new(bar_index, activeDir == 1 ? high : low, msgB, color=colPlanB, textcolor=color.black, style=activeDir == 1 ? label.style_label_down : label.style_label_up, size=size.tiny)
+
+    if enablePlanBCascade and str.contains(activeName, "Bat") and not planBTriggered and not na(activeX) and not na(activeC)
+        bool xBroken = activeDir == 1 ? close < activeX : close > activeX
+        if xBroken
+            planBTriggered := true
+            planBAlert := true
+            // Project Stingray 1.272 XA from Point A using stored pA approximation via activeX & activeD/0.886
+            float approxXA = math.abs(activeX - activeD) / 0.886
+            float stingD = activeDir == 1 ? activeX - approxXA * 0.272 : activeX + approxXA * 0.272
+            float pad = approxXA * 0.03
+            activePlanBBox := box.new(bar_index, stingD + pad, bar_index + 30, stingD - pad, bgcolor=color.new(colPlanB, 80), border_color=colPlanB, border_width=2)
+            label.new(bar_index, stingD, "PLAN B: Stingray 1.272 PRZ\n" + str.tostring(stingD, format.mintick), color=colPlanB, textcolor=color.black, style=activeDir == 1 ? label.style_label_up : label.style_label_down, size=size.small)
+
+alertcondition(bullPrzAlert, title="Bullish Harmonic / Stingray PRZ", message="MD PRZ Alert: Bullish {{ticker}} {{interval}} entered Harmonic/Stingray PRZ at {{close}}")
+alertcondition(bearPrzAlert, title="Bearish Harmonic / Stingray PRZ", message="MD PRZ Alert: Bearish {{ticker}} {{interval}} entered Harmonic/Stingray PRZ at {{close}}")
+alertcondition(planBAlert, title="Cascade Plan B Stingray 1.272 Activated", message="MD Cascade Alert: Plan A Bat Point X broken on {{ticker}} — Switch to Plan B Stingray 1.272 PRZ")
+alertcondition(pointBAlert, title="Point B Trigger Dump/Pump", message="MD Trigger Alert: Point B broken on {{ticker}} {{interval}} at {{close}}")

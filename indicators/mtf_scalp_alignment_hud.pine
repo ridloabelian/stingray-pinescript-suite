@@ -1,0 +1,110 @@
+//@version=6
+indicator("3-TF Scalping Alignment & Session Sweep HUD [Franz / MD]", shorttitle="MD 3-TF Scalp HUD", overlay=true, max_boxes_count=100, max_labels_count=100)
+
+// ============================================================================
+// Franz (@franzz_md) & Arist MD Session / Scalping Alignment Engine:
+//   - Checks 3-TF Alignment (M15 / M5 / M1) -> No-Trade unless 3/3 aligned
+//   - RSI(14) neutral blocker (~45-55 warning)
+//   - Asia Session Range (06:00-14:00 WIB / UTC+7) + London Open Sweep (15:00 WIB)
+//   - Last 120s before Candle Close countdown readiness indicator
+// ============================================================================
+
+grpTF = "1. 3-TF Alignment Settings"
+maBiasLen = input.int(20, "Trend Bias EMA Period", minval=5, group=grpTF)
+rsiLen = input.int(14, "RSI Length", minval=5, group=grpTF)
+rsiLow = input.float(45.0, "RSI Neutral Lower Bound", minval=30.0, maxval=50.0, group=grpTF)
+rsiHigh = input.float(55.0, "RSI Neutral Upper Bound", minval=50.0, maxval=70.0, group=grpTF)
+
+grpSess = "2. WIB Session Sweep Settings (UTC+7)"
+asiaSess = input.session("0600-1400", "Asia Session Range (WIB)", group=grpSess)
+londonSess = input.session("1500-1900", "London Open Sweep Window (WIB)", group=grpSess)
+nySess = input.session("1900-2359", "New York Active Window (WIB)", group=grpSess)
+tzWib = "Asia/Jakarta"
+
+f_tf_bias() =>
+    float e = ta.ema(close, maBiasLen)
+    int dir = close > e and e > e[1] ? 1 : close < e and e < e[1] ? -1 : 0
+    dir
+
+int dirM15 = request.security(syminfo.tickerid, "15", f_tf_bias(), lookahead=barmerge.lookahead_off)
+int dirM5 = request.security(syminfo.tickerid, "5", f_tf_bias(), lookahead=barmerge.lookahead_off)
+int dirM1 = request.security(syminfo.tickerid, "1", f_tf_bias(), lookahead=barmerge.lookahead_off)
+
+float rsiVal = ta.rsi(close, rsiLen)
+bool rsiNeutral = rsiVal >= rsiLow and rsiVal <= rsiHigh
+
+bool alignedBull = dirM15 == 1 and dirM5 == 1 and dirM1 == 1
+bool alignedBear = dirM15 == -1 and dirM5 == -1 and dirM1 == -1
+bool alignedAll = alignedBull or alignedBear
+
+// Session Range Tracking in WIB
+bool inAsia = not na(time(timeframe.period, asiaSess, tzWib))
+bool inLondon = not na(time(timeframe.period, londonSess, tzWib))
+bool inNy = not na(time(timeframe.period, nySess, tzWib))
+
+var float asiaHi = na
+var float asiaLo = na
+var int asiaStartBar = na
+var box asiaBox = na
+var bool londonSweptHi = false
+var bool londonSweptLo = false
+
+if inAsia and not inAsia[1]
+    asiaHi := high
+    asiaLo := low
+    asiaStartBar := bar_index
+    londonSweptHi := false
+    londonSweptLo := false
+    asiaBox := box.new(bar_index, asiaHi, bar_index + 1, asiaLo, bgcolor=color.new(color.blue, 90), border_color=color.new(color.blue, 40))
+
+if inAsia and not na(asiaBox)
+    asiaHi := math.max(asiaHi, high)
+    asiaLo := math.min(asiaLo, low)
+    box.set_top(asiaBox, asiaHi)
+    box.set_bottom(asiaBox, asiaLo)
+    box.set_right(asiaBox, bar_index)
+
+bool sweepAsiaHiNow = false
+bool sweepAsiaLoNow = false
+if inLondon and not na(asiaHi) and not na(asiaLo)
+    if not londonSweptHi and high > asiaHi and close <= asiaHi
+        londonSweptHi := true
+        sweepAsiaHiNow := true
+        label.new(bar_index, high, "London Sweep Asia HIGH", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+    if not londonSweptLo and low < asiaLo and close >= asiaLo
+        londonSweptLo := true
+        sweepAsiaLoNow := true
+        label.new(bar_index, low, "London Sweep Asia LOW", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+
+// Last 120s Candle Close Readiness Check
+int tfSec = timeframe.in_seconds(timeframe.period)
+int secToClose = not na(time_close) ? math.max(0, math.round((time_close - timenow) / 1000)) : 0
+bool closeReady = tfSec >= 60 and secToClose <= 120
+
+// Top-Right Alignment HUD Table
+var table hud = table.new(position.bottom_right, 2, 6, border_width=1)
+if barstate.islast
+    table.cell(hud, 0, 0, "3-TF Alignment (M15/M5/M1)", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    string alignTxt = alignedBull ? "3/3 BULLISH (EXEC READY)" : alignedBear ? "3/3 BEARISH (EXEC READY)" : "NO-TRADE: MTF MISMATCH"
+    color alignCol = alignedBull ? color.green : alignedBear ? color.red : color.gray
+    table.cell(hud, 1, 0, alignTxt, bgcolor=alignCol, text_color=color.white, text_size=size.small)
+
+    string tfBreakdown = str.format("M15:{0} | M5:{1} | M1:{2}", dirM15 == 1 ? "UP" : dirM15 == -1 ? "DN" : "-", dirM5 == 1 ? "UP" : dirM5 == -1 ? "DN" : "-", dirM1 == 1 ? "UP" : dirM1 == -1 ? "DN" : "-")
+    table.cell(hud, 0, 1, "TF Breakdown", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, tfBreakdown, bgcolor=color.rgb(15, 23, 42), text_color=color.aqua, text_size=size.small)
+
+    table.cell(hud, 0, 2, "RSI(14) Filter", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 2, str.tostring(rsiVal, "#.0") + (rsiNeutral ? " (WARN ~50 NO-TRADE)" : " (OK Extreme)"), bgcolor=rsiNeutral ? color.orange : color.rgb(15, 23, 42), text_color=color.white, text_size=size.small)
+
+    string sessStr = inAsia ? "ASIA (JPY/AUD)" : inLondon ? "LONDON SWEEP" : inNy ? "NEW YORK (XAU/MAJ)" : "AFTER 00:00 WIB (NO-TRADE)"
+    table.cell(hud, 0, 3, "WIB Session", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 3, sessStr, bgcolor=color.rgb(15, 23, 42), text_color=color.yellow, text_size=size.small)
+
+    table.cell(hud, 0, 4, "Asia High / Low", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 4, not na(asiaHi) ? str.tostring(asiaHi, format.mintick) + " / " + str.tostring(asiaLo, format.mintick) : "N/A", bgcolor=color.rgb(15, 23, 42), text_color=color.white, text_size=size.small)
+
+    table.cell(hud, 0, 5, "Last 120s Close", bgcolor=color.rgb(30, 41, 59), text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 5, closeReady ? str.tostring(secToClose) + "s (READY)" : str.tostring(secToClose) + "s (WAIT)", bgcolor=closeReady ? color.green : color.rgb(15, 23, 42), text_color=color.white, text_size=size.small)
+
+alertcondition(alignedAll and not rsiNeutral, title="3-TF Scalp Alignment Valid", message="MD/Franz HUD: 3/3 TF Aligned on {{ticker}} ({{close}})")
+alertcondition(sweepAsiaHiNow or sweepAsiaLoNow, title="London Open Asia Range Sweep", message="MD Session Alert: London Open swept Asia High/Low on {{ticker}} at {{close}}")
